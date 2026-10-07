@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="120" viewBox="0 0 600 120" role="img" aria-label="Rafi Ahmed on TokenTracker">
+  <defs>
+    <linearGradient id="av" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#0d9488"/>
+    </linearGradient>
+    <clipPath id="bar">
+      <rect x="24" y="86" width="552" height="8" rx="4"/>
+    </clipPath>
+  </defs>
+
+  <rect width="600" height="120" rx="14" fill="#0b0f1a" stroke="#1e293b"/>
+
+  <g font-family="ui-monospace, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace">
+    <text x="24" y="30" font-size="9" letter-spacing="3" font-weight="600" fill="#475569">TOKENTRACKER</text>
+    <text x="576" y="30" font-size="9" fill="#475569" text-anchor="end">tokentracker.cc</text>
+  </g>
+
+  <g transform="translate(40 58)">
+    <circle r="15" fill="url(#av)"/>
+    <text x="0" y="0" font-size="13" font-weight="700" text-anchor="middle" dominant-baseline="central"
+      font-family="ui-monospace, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace" fill="#064e3b">R</text>
+  </g>
+
+  <g font-family="ui-monospace, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace">
+    <text x="64" y="64" font-size="15" font-weight="600" fill="#e2e8f0">Rafi Ahmed<tspan font-size="11" font-weight="400" fill="#64748b"> · all-time</tspan></text>
+    <text x="576" y="64" font-size="13" text-anchor="end"><tspan fill="#f1f5f9">11.55B tok</tspan><tspan fill="#475569"> │ </tspan><tspan fill="#94a3b8">$616</tspan><tspan fill="#475569"> │ </tspan><tspan fill="#34d399">#652</tspan></text>
+  </g>
+
+  <rect x="24" y="86" width="552" height="8" rx="4" fill="#1e293b"/>
+  <g clip-path="url(#bar)">
+    <rect x="24" y="86" width="331" height="8" fill="#10b981"/>
+    <rect x="355" y="86" width="143" height="8" fill="#6366f1"/>
+    <rect x="498" y="86" width="72" height="8" fill="#f59e0b"/>
+  </g>
+
+  <g font-family="ui-monospace, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace" font-size="10" fill="#64748b">
+    <circle cx="27" cy="107" r="3" fill="#10b981"/>
+    <text x="35" y="110">Claude 60%</text>
+    <circle cx="112" cy="107" r="3" fill="#6366f1"/>
+    <text x="120" y="110">Codex 26%</text>
+    <circle cx="200" cy="107" r="3" fill="#f59e0b"/>
+    <text x="208" y="110">Hermes 13%</text>
+  </g>
+</svg>
