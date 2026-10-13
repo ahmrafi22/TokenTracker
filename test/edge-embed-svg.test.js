@@ -179,7 +179,7 @@ test("every gradient and clip-path reference resolves", () => {
 function settledFor(svg, suffix) {
   const baseline = suffix === "tok" ? 150 : 149;
   const CELL = new RegExp(
-    '<g clip-path="url\\(#odo-' + suffix + '-\\d+\\)"><g>' +
+    '<g clip-path="url\\(#odo-' + suffix + '-\\d+\\)"><g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
       '(?:<text[^>]*>\\d</text>){10}' +
       '<animateTransform[^>]*values="[^"]*"[^>]*\\/?>' +
       '</g></g>',
@@ -388,7 +388,7 @@ test("the backdrop is static: no animation anywhere behind the figures", () => {
   // one thing the reader is meant to take in.
   for (const [name, svg] of [["hero", hero()], ["light hero", hero({}, "light")]]) {
     // Nothing in the backdrop may animate at all. The only animations on the
-    // card are the ten digit strips (translate) and three provider bar widths.
+    // card are the digit strips (translate) and the provider bar widths.
     const backdrop = svg.slice(0, svg.indexOf('<g font-family='));
     assert.ok(!backdrop.includes("<animate"), `${name}: the backdrop animates`);
     assert.ok(!backdrop.includes("<animateTransform"), `${name}: the backdrop transforms`);
@@ -404,12 +404,13 @@ test("the backdrop is static: no animation anywhere behind the figures", () => {
     assert.deepEqual(stars, [], `${name}: backdrop still paints ${stars.length} specks`);
   }
 
-  // The card as a whole animates only where it should: the ten digit strips
-  // and the three provider bars.
+  // The card as a whole animates only where it should: the digit strips (ten
+  // on the stats, two per provider percent row — the mock's 60/26/14) and the
+  // three provider bars.
   const svg = hero();
   assert.equal(
     [...svg.matchAll(/<animateTransform[^>]*type="translate"/g)].length,
-    10,
+    16,
     "unexpected translation somewhere on the card",
   );
   assert.equal(
@@ -481,6 +482,88 @@ test("digits are set tightly, not tracked out", () => {
     dotLeft - prevCell < 22,
     `${(dotLeft - prevCell).toFixed(2)}px after the previous digit`,
   );
+});
+
+test("provider rows centre the bar and logo on the label's cap line", () => {
+  // The bar sat at baseline-7, which put its centre 1.22px above the label's
+  // optical centre — enough for the rows to read as mis-aligned. Everything in
+  // a row is now derived from the cap line (cap height ~0.72em), so the bar and
+  // the logo are placed rather than nudged.
+  const svg = hero();
+  const ROW_FONT = 10.5, CAP = 0.72;
+  const capMid = (ROW_FONT * CAP) / 2;
+
+  const bars = [...svg.matchAll(/<rect x="[\d.]+" y="([\d.]+)" width="47" height="4"/g)]
+    .map((m) => Number(m[1]));
+  assert.equal(bars.length, 3, `expected three bar tracks, found ${bars.length}`);
+
+  for (const label of ["Claude", "Codex", "Hermes"]) {
+    const y = Number(svg.match(
+      new RegExp(`<text x="[\\d.]+" y="(\\d+)" font-size="10.5"[^>]*>${label}<`),
+    )[1]);
+    const barY = bars.reduce((a, b) => (Math.abs(b - y) < Math.abs(a - y) ? b : a));
+    const offset = barY + 2 - (y - capMid);
+    assert.ok(
+      Math.abs(offset) < 0.05,
+      `${label}: bar centre is ${offset.toFixed(2)}px off the label's cap line`,
+    );
+  }
+
+  // The bar only gets what survives the label column, the percent's "100%"
+  // reservation, and the card's right margin — so the label must still clear
+  // the bar by a real gap ("Hermes" is ~33px of it).
+  const barX = Number(svg.match(/<rect x="([\d.]+)" y="1[2-6][\d.]*" width="47" height="4"/)[1]);
+  // The percent is right-anchored, so exclude it when finding the label column.
+  const labelX = Number(svg.match(/<text x="([\d.]+)" y="1[2-6][\d.]*" font-size="10.5" fill="[^"]*">[A-Za-z]+</)[1]);
+  assert.ok(labelX >= 450, `label starts at ${labelX}, too far left`);
+  assert.ok(barX - labelX >= 40, `only ${(barX - labelX).toFixed(1)}px between label and bar`);
+
+  // The heading/share panel, the percent column, and the brand lockup share
+  // one right margin: the percentages' INK lands on the bolt tile's right
+  // edge. The odometer right-aligns by cell advance, so the grid is pulled in
+  // by the "%" ink overshoot (2.2px) and the static "%" glyph's grid edge —
+  // its centre plus half the 18*k*0.8 cell — sits that far inside the margin.
+  const tileRight = Number(svg.match(/<rect x="([\d.]+)" y="[\d.]+" width="22" height="22"[^>]*fill="url\(#tt-tile-22\)"/)[1]) + 22;
+  const pctCentre = Number(svg.match(/<text x="([\d.]+)" y="124\.00" text-anchor="middle"[^>]*>%<\/text>/)[1]);
+  const gridRight = pctCentre + (18 * 0.8 * (10.5 / 30)) / 2;
+  assert.ok(
+    Math.abs(gridRight - (tileRight - 2.2)) < 0.6,
+    `percent grid ends at ${gridRight.toFixed(2)}; expected ${tileRight - 2.2} (tile edge ${tileRight} less the % bleed)`,
+  );
+
+  // The heading and the logo column share a left edge.
+  const heading = Number(svg.match(/<text x="(\d+)" y="104"[^>]*>TOP PROVIDERS</)[1]);
+  assert.equal(heading, 438, `heading at ${heading}; the panel's left edge moved`);
+});
+
+test("provider percentages count up on the odometer and rest at their value", () => {
+  const svg = hero();
+  // Each provider percent is a digit odometer with its own cells (p0/p1/p2),
+  // so the shares roll up from zero rather than sitting as static text.
+  for (const row of [0, 1, 2]) {
+    const cells = [...svg.matchAll(new RegExp(`id="odo-p${row}-(\\d+)"`, "g"))].map((m) => m[1]);
+    assert.ok(cells.length, `provider row ${row} has no odometer cells`);
+  }
+
+  // A digit whose target is 0 (the "0" in 60/26/14) must still produce a VALID
+  // SMIL animation — values and keyTimes equal length, keyTimes 0 -> 1 — even
+  // though it has no travel. A malformed single-frame animate is the failure
+  // mode that silently disables the whole strip.
+  let held = 0;
+  for (const m of svg.matchAll(
+    /<g clip-path="url\(#odo-p\d-\d\)"><g transform="translate\(0 ([\d.]+)\)">(?:<text[^>]*>\d<\/text>){10}<animateTransform[^>]*values="([^"]*)"[^>]*keyTimes="([^"]*)"/g,
+  )) {
+    const vals = m[2].split(";");
+    const kt = m[3].split(";").map(Number);
+    assert.equal(vals.length, kt.length, "values and keyTimes must agree in length");
+    assert.equal(kt[0], 0, "a strip's keyTimes must start at 0");
+    assert.equal(kt[kt.length - 1], 1, "a strip's keyTimes must end at 1");
+    if (Number(m[1]) === 0) {
+      held++;
+      assert.equal(new Set(vals).size, 1, "a zero digit must hold its resting glyph");
+    }
+  }
+  assert.ok(held >= 1, "expected a percent row to rest a digit on 0");
 });
 
 test("stats are bare type with hairline dividers, not boxed pills", () => {
@@ -637,12 +720,22 @@ test("the TOKENS stat renders the app's rolling odometer as SMIL", () => {
   const cells = [...svg.matchAll(/id="odo-tok-(\d+)"/g)].map((m) => m[1]);
   assert.deepEqual(cells, ["0", "1", "3", "4"], "expected all four digits to animate");
 
-  // Each animated strip must actually travel: a zero-length animation is the
-  // failure mode where the digits never move.
-  for (const m of svg.matchAll(/<animateTransform[^>]*values="([^"]*)"/g)) {
-    const first = m[1].split(";")[0].trim();
-    const last = m[1].split(";").pop().trim();
-    assert.notEqual(first, last, `strip animation has no travel: ${m[1].slice(0, 40)}`);
+  // Each TOKENS digit strip must actually travel: a zero-length animation is
+  // the failure mode where a digit never moves. Scoped to TOKENS because its
+  // figure (11.55B) has no zero digit; a percent row's "0" (60%) legitimately
+  // rests at zero and must not travel.
+  const tokStrips = new RegExp(
+    '<g clip-path="url\\(#odo-tok-\\d+\\)"><g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
+      "(?:<text[^>]*>\\d</text>){10}" +
+      '<animateTransform[^>]*values="([^"]*)"',
+    "g",
+  );
+  const tokAnim = [...svg.matchAll(tokStrips)];
+  assert.equal(tokAnim.length, 4, "expected four TOKENS digit strips");
+  for (const [, vals] of tokAnim) {
+    const first = vals.split(";")[0].trim();
+    const last = vals.split(";").pop().trim();
+    assert.notEqual(first, last, `strip animation has no travel: ${vals.slice(0, 40)}`);
   }
 
   // Every animated strip must END at rest (translate 0), and the approach must be
@@ -687,8 +780,10 @@ test("the roll plays once and then freezes, rather than looping", () => {
   const svg = hero();
   assert.ok(!svg.includes('repeatCount="indefinite"'), "the odometer must not loop");
   const anims = [...svg.matchAll(/<animateTransform[^>]*>/g)].map((m) => m[0]);
-  // 10 digit cells across the three figures: 4 for TOKENS, 3 each for COST/RANK.
-  assert.equal(anims.length, 10, "expected one animation per digit cell");
+  // 10 digit cells across the three stats (4 for TOKENS, 3 each for COST/RANK)
+  // plus the provider percents, which count on the same odometer: two digits
+  // per row for the mock's 60/26/14.
+  assert.equal(anims.length, 16, "expected one animation per digit cell");
   for (const a of anims) {
     assert.match(a, /fill="freeze"/, "each strip must hold its final frame");
   }
