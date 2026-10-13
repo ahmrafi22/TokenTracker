@@ -211,8 +211,10 @@ function settledFor(svg, suffix) {
     if (spans.some(([a, b]) => g.index >= a && g.index < b)) continue;
     // Only this figure's own glyphs, which share its baseline. The avatar's
     // initial is a capital at a similar x but a completely different baseline,
-    // and the neighbouring stats bring their own "$"/"#".
-    if (!/^[.#$A-Z]$/.test(g[2])) continue;
+    // and the neighbouring stats bring their own "$"/"#". "," is in the set
+    // because formatCost's thousands separator is a static cell of the figure,
+    // not decoration — without it a "$1,235" card reads back as "$1235".
+    if (!/^[.#$,A-Z]$/.test(g[2])) continue;
     if (Math.abs(Number(g[1]) - baseline) > 0.05) continue;
     const x = Number(/x="([\d.]+)"/.exec(g[0])[1]);
     // A currency or rank prefix sits just left of the first cell, one pitch out.
@@ -250,6 +252,39 @@ test("hero card renders the mock snapshot values", () => {
   assert.match(svg, /Claude/);
   assert.match(svg, /Codex/);
   assert.match(svg, /Hermes/);
+});
+
+test("the odometer settles on the rounded figure, not the raw value", () => {
+  // The roll used to divide the RAW number by a suffix scale, while every digit
+  // is taken with floor(). compactNumber and formatCost round instead, so the two
+  // disagreed whenever rounding went up — and the mock row above happens not to,
+  // which is why this went unnoticed. Roughly half of all real values are affected.
+  //
+  // Each case below is one where they disagree, and each asserts against the
+  // printed title so the badge can never contradict its own <title>/aria-label.
+  const cases = [
+    // floor(1155.6) = 1155 -> 11.55B; toFixed(2) printed "11.56".
+    [{ total_tokens: 11_556_000_000 }, "11.56B"],
+    // The carry case: "11.999" prints as "12B" once the trailing zeros are
+    // trimmed, so the cells are places 10 and 1 — and 11.999 floored is 11B.
+    [{ total_tokens: 11_999_000_000 }, "12B"],
+    // formatCost rounds .5 up; floor() on the raw cost does not.
+    [{ estimated_cost_usd: 616.6 }, "$617"],
+    [{ estimated_cost_usd: 1234.5 }, "$1,235"],
+  ];
+  for (const [overrides, expected] of cases) {
+    const svg = hero(overrides);
+    const label = Object.values(overrides)[0];
+    if (overrides.total_tokens !== undefined) {
+      assert.equal(settledTokens(svg), expected, `${label} tokens settle on the wrong value`);
+      assert.ok(
+        svg.includes(`<title>`) && svg.includes(expected),
+        `${label} tokens are absent from the title the badge shows`,
+      );
+    } else {
+      assert.equal(settledFor(svg, "cost"), expected, `${label} cost settles on the wrong value`);
+    }
+  }
 });
 
 test("hero card escapes XML in the display name", () => {

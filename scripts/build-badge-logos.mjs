@@ -15,8 +15,9 @@
 //     gradient + mask/clip ids that would otherwise collide across providers);
 //   * `currentColor` becomes a literal (it does not resolve inside an <img>);
 //   * dark-on-dark fills (hermes' #0a0a0a) become a legible light color;
-//   * gemini's 11 <filter> elements are dropped — filters rasterize poorly
-//     through camo and each would add hundreds of bytes.
+//   * gemini's 11 <filter> elements are dropped, along with the filter="url(#…)"
+//     references they left behind — filters rasterize poorly through camo, each
+//     would add hundreds of bytes, and a pointer to a deleted id is an error.
 //
 // Usage: node scripts/build-badge-logos.mjs [--write] [--json]
 //   (default prints a summary; --write regenerates the const in
@@ -80,7 +81,12 @@ function stripFilters(inner) {
     if (next === out) break;
     out = next;
   }
-  return out;
+  // Drop the references those elements left behind. A filter="url(#…)" pointing
+  // at an id nothing defines is an error, and browsers disagree about what to do
+  // with it: some skip the filter, some refuse to render the element at all. The
+  // affected logo then loses its coloured layers in one browser and nothing in
+  // another, so the markup has to carry neither the definition nor the pointer.
+  return out.replace(/\sfilter="url\(#[^)]+\)"/gi, "");
 }
 
 function normalize(inner, prefix, opts) {

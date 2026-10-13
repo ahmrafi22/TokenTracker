@@ -1,26 +1,40 @@
 #!/usr/bin/env node
 // Local preview for dashboard/edge-patches/tokentracker-embed-svg.ts without
-// deploying to InsForge. The render helpers (renderProfileCard, PALETTE,
-// avatarSvg) are pure — a snapshot row in, an SVG string out — so only the
+// deploying to InsForge. The render helpers (renderProfileCard, placeholderSvg,
+// PALETTE) are pure — a snapshot row in, an SVG string out — so only the
 // cloud-only bits (the @insforge/sdk import and Deno.env reads) need stubbing.
 //
 // How it works: reads the edge file, strips the single `npm:@insforge/sdk`
 // import, appends an export of the render helpers, writes the patched copy to
 // a temp dir, and imports it with a `Deno` global stub. Node >= 22.6 strips
-// the TypeScript types natively, so no build step is needed.
+// the TypeScript types natively, so no build step is needed — that floor is
+// higher than the package's `engines.node` (>=20), because Node 20 cannot
+// import a .ts file at all, so it is checked for explicitly below.
 //
 // Usage:
 //   node scripts/preview-embed-svg.mjs [--theme dark|light] [--period week|month|total]
 //                                      [--name "Display Name"]
 //                                      [--all-providers] [--out file.svg] [--no-open]
 //
-// The mock row mirrors a tokentracker_leaderboard_snapshots row (11.55B total,
+// The mock row mirrors a tokentracker_leaderboard_snapshots row (12.52B total,
 // Claude 60% / Codex 26% / Hermes 13%) so output matches a real badge closely.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+// Node 20 satisfies `engines.node` but cannot strip types off a .ts import, and
+// the failure it produces is an opaque ERR_UNKNOWN_FILE_EXTENSION. Fail here
+// with something that names the actual cause instead.
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 6)) {
+  console.error(
+    `preview-embed-svg.mjs needs Node >= 22.6 for native TypeScript stripping; ` +
+      `this is ${process.versions.node}.`,
+  );
+  process.exit(1);
+}
 
 const args = process.argv.slice(2);
 const get = (flag, fallback) => {
@@ -29,7 +43,6 @@ const get = (flag, fallback) => {
 };
 const theme = get("--theme", "dark");
 const period = get("--period", "total");
-const style = get("--style", "hero");
 const name = get("--name", "Rafi Ahmed");
 const outFlag = get("--out", "embed-svg-preview.svg");
 const shouldOpen = !args.includes("--no-open");
@@ -42,9 +55,9 @@ if (!["week", "month", "total"].includes(period)) {
   console.error(`bad --period: ${period} (use week|month|total)`);
   process.exit(1);
 }
-// Each variant writes its own file unless --out says otherwise, so rendering
-// dark + light + both styles in a row doesn't silently overwrite one another.
-const defaultOut = `embed-svg-preview-${theme}-${style}.svg`;
+// Each theme writes its own file unless --out says otherwise, so rendering dark
+// and light in a row doesn't silently overwrite one another.
+const defaultOut = `embed-svg-preview-${theme}.svg`;
 const out = args.includes("--out") ? outFlag : defaultOut;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -70,9 +83,9 @@ const { renderProfileCard } = await import(pathToFileURL(patchedPath).href + `?v
 const mockRow = {
   user_id: "00000000-0000-0000-0000-000000000000",
   display_name: name,
-  rank: 652,
-  total_tokens: 11_550_000_000,
-  estimated_cost_usd: 616.4,
+  rank: 685,
+  total_tokens: 12_520_000_000,
+  estimated_cost_usd: 696.4,
   gpt_tokens: 3_000_000_000,
   claude_tokens: 6_900_000_000,
   gemini_tokens: 0,
@@ -92,7 +105,18 @@ const mockRow = {
 
 const svg = renderProfileCard({ row: mockRow, theme, period });
 fs.writeFileSync(out, svg);
-console.log(`wrote ${out} (theme=${theme} period=${period} style=${style})`);
+console.log(`wrote ${out} (theme=${theme} period=${period})`);
 if (shouldOpen) {
-  exec(`${process.platform === "win32" ? "start" : "open"} ${JSON.stringify(out)}`);
+  // execFile, not exec: the output path reaches the opener as its own argv
+  // entry, so a crafted --out can't smuggle shell metacharacters through
+  // JSON.stringify (which escapes nothing inside double quotes). The opener is
+  // also picked per platform — `open` does not exist on Linux, and cmd's `start`
+  // reads a quoted first argument as a window title rather than a file.
+  const [cmd, cmdArgs] =
+    process.platform === "win32"
+      ? ["cmd", ["/c", "start", '""', path.resolve(out)]]
+      : process.platform === "darwin"
+        ? ["open", [out]]
+        : ["xdg-open", [out]];
+  execFile(cmd, cmdArgs, () => {});
 }
