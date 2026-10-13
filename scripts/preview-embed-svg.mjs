@@ -107,16 +107,20 @@ const svg = renderProfileCard({ row: mockRow, theme, period });
 fs.writeFileSync(out, svg);
 console.log(`wrote ${out} (theme=${theme} period=${period})`);
 if (shouldOpen) {
-  // execFile, not exec: the output path reaches the opener as its own argv
-  // entry, so a crafted --out can't smuggle shell metacharacters through
-  // JSON.stringify (which escapes nothing inside double quotes). The opener is
-  // also picked per platform — `open` does not exist on Linux, and cmd's `start`
-  // reads a quoted first argument as a window title rather than a file.
-  const [cmd, cmdArgs] =
+  // No shell anywhere on this path. exec() built a command string, so a crafted
+  // --out ran arbitrary commands; execFile() with a real executable closes that,
+  // because the path is passed as its own argv entry and never re-parsed.
+  //
+  // Windows notably does NOT go through `cmd /c start`: that hands the path back
+  // to cmd, which splits on `&`, and Node's argv quoting only triggers on spaces
+  // and quotes, so an unspaced `a&calc.svg` would execute calc. rundll32's
+  // FileProtocolHandler is the shell-free way to reach the same default handler,
+  // and it accepts paths with spaces because Node quotes those for us.
+  const [opener, openerArgs] =
     process.platform === "win32"
-      ? ["cmd", ["/c", "start", '""', path.resolve(out)]]
+      ? ["rundll32", ["url.dll,FileProtocolHandler", path.resolve(out)]]
       : process.platform === "darwin"
         ? ["open", [out]]
         : ["xdg-open", [out]];
-  execFile(cmd, cmdArgs, () => {});
+  execFile(opener, openerArgs, () => {});
 }
