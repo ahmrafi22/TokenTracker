@@ -24,18 +24,30 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Importing the edge file needs native TypeScript stripping, which
+// Importing the edge file needs native TypeScript handling, which
 // `engines.node: ">=20"` does not guarantee — Node 20 cannot do it at all, and
 // the failure it produces is an opaque ERR_UNKNOWN_FILE_EXTENSION. Ask Node
-// itself rather than parsing a version string: `process.features.typescript` is
-// "strip" only when stripping is actually active, which covers both routes (on
-// by default from Node 22.18, or --experimental-strip-types in 22.6-22.17).
-if (process.features.typescript !== "strip") {
+// rather than parsing a version string: `process.features.typescript` exists from
+// 22.10 and reads "strip" (on by default from 22.18, or 22.6-22.17 behind
+// --experimental-strip-types) or "transform" under --experimental-transform-types.
+// Either mode imports the file, so requiring "strip" would refuse a Node that can
+// run this. Before 22.10 the property is absent, so fall back to the version and
+// the flag, the only combination that worked there.
+const TS_MODE = process.features.typescript;
+const CAN_IMPORT_TS =
+  !!TS_MODE ||
+  (() => {
+    const [maj, min] = process.versions.node.split(".").map(Number);
+    if (maj > 22) return min >= 6;
+    if (maj < 22) return false;
+    return min >= 6 && process.execArgv.some((a) => a.startsWith("--experimental-strip-types"));
+  })();
+if (!CAN_IMPORT_TS) {
   console.error(
-    `preview-embed-svg.mjs needs Node's TypeScript stripping to import the edge ` +
+    `preview-embed-svg.mjs needs Node's TypeScript support to import the edge ` +
       `file: Node ${process.versions.node} reports ` +
-      `typescript=${process.features.typescript ?? "unavailable"}. ` +
-      `Use Node 22.18+ (or 22.6-22.17 with --experimental-strip-types).`,
+      `typescript=${TS_MODE ?? "unavailable"}. ` +
+      `Use Node 22.18+, or 22.6-22.17 with --experimental-strip-types.`,
   );
   process.exit(1);
 }

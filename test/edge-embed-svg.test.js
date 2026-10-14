@@ -19,7 +19,8 @@
 // failed in the shared `before` hook with ERR_UNKNOWN_FILE_EXTENSION. The suite
 // skips itself instead, rather than reporting a false failure on a version the
 // project says it supports. Stripping is default-on from Node 22.18; 22.6-22.17
-// need --experimental-strip-types, which process.features.typescript reflects.
+// need --experimental-strip-types. See CAN_IMPORT_TS below for how that is
+// detected, including the versions where Node does not report it at all.
 
 const fs = require("node:fs");
 const os = require("node:os");
@@ -32,11 +33,23 @@ const ROOT = path.join(__dirname, "..");
 const EDGE_FILE = path.join(ROOT, "dashboard", "edge-patches", "tokentracker-embed-svg.ts");
 const EXPORTS = ["renderProfileCard", "placeholderSvg", "PALETTE"];
 
-// "strip" covers both routes: enabled by default from 22.18, or switched on with
-// --experimental-strip-types in 22.6-22.17. Anything else cannot load the edge
-// file, so the whole suite is skipped rather than failing at import.
-const CAN_STRIP_TYPES = process.features.typescript === "strip";
-const test = CAN_STRIP_TYPES ? nodeTest : nodeTest.skip;
+// Whether Node can import a .ts file at all. Ask Node first:
+// `process.features.typescript` exists from 22.10 and reads "strip" (default from
+// 22.18, or 22.6-22.17 behind --experimental-strip-types) or "transform" when
+// --experimental-transform-types is on — either mode loads the file, so requiring
+// "strip" would reject a Node that can in fact run this. Before 22.10 the property
+// does not exist, so fall back to the version and the flag, which was the only
+// combination that worked there.
+const TS_MODE = process.features.typescript;
+const CAN_IMPORT_TS =
+  !!TS_MODE ||
+  (() => {
+    const [maj, min] = process.versions.node.split(".").map(Number);
+    if (maj > 22) return min >= 6;
+    if (maj < 22) return false;
+    return min >= 6 && process.execArgv.some((a) => a.startsWith("--experimental-strip-types"));
+  })();
+const test = CAN_IMPORT_TS ? nodeTest : nodeTest.skip;
 
 let api;
 
@@ -397,9 +410,14 @@ test("every digit strip finishes its roll, however many digits the figure has", 
   ];
   for (const [label, overrides] of CASES) {
     for (const svg of [hero(overrides), hero(overrides, "light")]) {
-      for (const m of svg.matchAll(
-        /<g clip-path="url\(#odo-[a-z0-9]+-\d+\)">[\s\S]*?<animateTransform[^>]*values="([^"]*)"/g,
-      )) {
+      // The cell group carries the shared ink after clip-path, so the matcher has
+      // to allow it — pinned here, because when it did not, this matched nothing
+      // and the test below passed without checking a single strip.
+      const strips = [...svg.matchAll(
+        /<g clip-path="url\(#odo-[a-z0-9]+-\d+\)"[^>]*>[\s\S]*?<animateTransform[^>]*values="([^"]*)"/g,
+      )];
+      assert.ok(strips.length > 0, `${label}: no digit strips matched — the settle check would be vacuous`);
+      for (const m of strips) {
         const values = m[1].split(";");
         const id = /url\(#(odo-[a-z0-9]+-\d+)\)/.exec(m[0])[1];
         assert.equal(
