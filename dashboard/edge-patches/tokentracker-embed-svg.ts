@@ -12,7 +12,7 @@
  * Query params:
  *   user_id  (required) UUID
  *   theme    light | dark             (default: light)
- *   period   week | month | total     (default: total) *
+ *   period   week | month | total       (default: total)
  * Privacy: gates on `is_public=true` (the same opt-in that the leaderboard
  * profile endpoint enforces). Private profiles → "private" placeholder SVG.
  *
@@ -71,7 +71,7 @@ const PALETTE = {
     accentSoft: "#8a7aff",
     // The star specks were #fbdfff at 0.5 opacity — near-white pink on a white
     // card, which is invisible. On the light surface they need to be a tint
-    // DARKER than the background to read at all, so the light theme gets its
+    // DARKER than the background to read at all.
     divider: "#dbd4f0",
     glowOpacity: 0.18,
     // White specular highlight in the top-left corner. Zero on the dark theme:
@@ -217,7 +217,22 @@ function compactNumber(n: number): string {
   return String(Math.round(n));
 }
 
+/**
+ * Formats a dollar figure for the stat row. Above a million it switches to the
+ * same S/M/B/T ladder compactNumber() uses, which bounds the printed width:
+ * `toLocaleString` on an unbounded cost kept adding digits
+ * ("$1,000,000,000,000,000"), and no amount of shrinking the row could fit that.
+ */
 function formatCost(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1e6) {
+    const units = [
+      [1e12, "T"], [1e9, "B"], [1e6, "M"],
+    ] as const;
+    for (const [scale, suffix] of units) {
+      if (abs >= scale) return "$" + (n / scale).toFixed(2).replace(/\.?0+$/, "") + suffix;
+    }
+  }
   if (n >= 1000) return "$" + Math.round(n).toLocaleString("en-US");
   if (n >= 100) return "$" + n.toFixed(0);
   return "$" + n.toFixed(2);
@@ -483,6 +498,23 @@ const ODO_ADVANCE = 18;   // tabular digit width
 // wider than the ink or a digit would collide with the one it rolls past.
 const ODO_GAP = 2;        // space between cells
 const ODO_CELL_H = 23;    // clip height; cap height is ~0.72em
+
+/**
+ * Each static glyph's cell width as a multiple of ODO_ADVANCE, measured from
+ * Inter's hmtx/glyf at 30px. A cell narrower than the glyph's advance pushes its
+ * ink into the neighbouring digit: M advances 1.51x a digit, and the flat 0.8
+ * slot the suffixes used made "4.12M" read as "4.12 M".
+ */
+const ODO_STATIC_WIDTH: Record<string, number> = {
+  ".": 0.48,
+  "#": 1.06,
+  "$": 1.07,
+  "%": 1.64,
+  B: 1.09,
+  T: 1.08,
+  K: 1.12,
+  M: 1.51,
+};
 // Baseline for a stat figure, by font size. 150 at 30px and 149 at 21px is a
 // 1px drop for a 9px size difference — tuned optical alignment, not a formula.
 //
@@ -496,13 +528,21 @@ const STAT_BASELINES: Record<number, number> = {
 };
 function statBaseline(fontSize: number): number {
   const known = STAT_BASELINES[fontSize];
-  if (known === undefined) {
-    throw new Error(
-      `statBaseline: no baseline tuned for fontSize ${fontSize}. Add one to STAT_BASELINES ` +
-      `(rendered at ${ODO_FONT} and 21 today) — an untuned size renders sliced digits.`,
-    );
+  if (known !== undefined) return known;
+  // A crowded row shrinks its figures, and rank is unbounded, so sizes below the
+  // tuned 21px are reachable. There is deliberately no lower bound: rank has no
+  // ceiling, so any floor here would eventually throw on a legitimate row. The
+  // clip window scales with the font, so the digits get small, never sliced.
+  const sizes = Object.keys(STAT_BASELINES).map(Number).sort((a, b) => a - b);
+  const [lo, hi] = sizes;
+  if (fontSize > 0 && fontSize <= hi) {
+    const f = (fontSize - lo) / (hi - lo);
+    return STAT_BASELINES[lo] + f * (STAT_BASELINES[hi] - STAT_BASELINES[lo]);
   }
-  return known;
+  throw new Error(
+    `statBaseline: fontSize ${fontSize} is outside the renderable range 0..${hi} — ` +
+    `the stat figures cannot be laid out at this size.`,
+  );
 }
 // Per-digit delay, as a fraction of the roll.
 const ODO_STAGGER = 0.1;
@@ -566,16 +606,6 @@ function odoPlaceDigit(value: number, place: number): number {
 }
 
 /**
- * Lays out one digit's strip and returns its travel.
- *
- * Glyph d sits at `baseline + (d - digit) * pitch`, so the TARGET digit rests on
- * the baseline and digit 0 sits `digit` pitches below it. Translating from
- * `+digit * pitch` down to 0 rolls it from showing 0 to showing the target.
- * Deriving both endpoints from that one relationship avoids sign errors, which
- * are easy here: translating the other way pulls each strip off its target and,
- * for a digit of 5, clean out of the clip window.
- */
-/**
  * Rebuilds a formatted number's cell layout from its own characters, so the roll
  * matches whatever formatter produced it — suffix and trailing-zero trimming
  * included. "11.55B" becomes digit(10), digit(1), static("."), digit(0.1),
@@ -622,6 +652,16 @@ function barStart(row: number): number {
 // whatever it is given, so the spring needs enough points to read as a curve.
 const BAR_SAMPLES = 24;
 
+/**
+ * Lays out one digit's strip and returns its travel.
+ *
+ * Glyph d sits at `baseline + (d - digit) * pitch`, so the TARGET digit rests on
+ * the baseline and digit 0 sits `digit` pitches below it. Translating from
+ * `+digit * pitch` down to 0 rolls it from showing 0 to showing the target.
+ * Deriving both endpoints from that one relationship avoids sign errors, which
+ * are easy here: translating the other way pulls each strip off its target and,
+ * for a digit of 5, clean out of the clip window.
+ */
 function odoStrip(target: number) {
   const digit = odoPlaceDigit(target, 1);
   return {
@@ -633,9 +673,9 @@ function odoStrip(target: number) {
 }
 
 /**
- * Renders `display` as an odometer that rolls from 0 to `target` once on load,
- * looping. `cells` describes each column: a digit with its decimal place, or a
- * static glyph.
+ * Renders `display` as an odometer that rolls from 0 to `target` once on load and
+ * then freezes there (`fill="freeze"` — it does not loop). `cells` describes each
+ * column: a digit with its decimal place, or a static glyph.
  */
 function odometerSvg(opts: {
   x: number;
@@ -660,7 +700,14 @@ function odometerSvg(opts: {
   const advance = ODO_ADVANCE * k;
   const gap = ODO_GAP * k;
   const cellH = ODO_CELL_H * k;
-  const duration = ODO_DURATION;
+  // The delay is no longer a SMIL `begin` offset — it is a HOLD at the start of
+  // the animation's own timeline (see keyTimes below). That keeps one thing true
+  // in every renderer: the base attributes already hold the final value, so a
+  // renderer that ignores SMIL entirely shows the correct card, while an SMIL one
+  // still sits at zero for ODO_DELAY and then rolls.
+  const duration = ODO_DELAY + ODO_DURATION;
+  // Fraction of that total spent holding at zero before the roll begins.
+  const holdEnd = ODO_DELAY / duration;
   let cursor = x;
   const parts: string[] = [];
   const clips: string[] = [];
@@ -673,10 +720,14 @@ function odometerSvg(opts: {
   let digitSlot = 0;
   cells.forEach((cell, i) => {
     if (cell.kind === "static") {
-      // "#" is the widest static glyph — its ink fills a digit's width, so it
-      // gets a full cell rather than the narrow 0.8 slot the suffixes use. The
-      // trailing gap after it is then a small one, not a space-width hole.
-      const w = cell.ch === "." ? advance * 0.34 : cell.ch === "#" ? advance : advance * 0.8;
+      // A static glyph's cell is sized from the real face via ODO_STATIC_WIDTH,
+      // as a multiple of a digit's advance. One flat 0.8 was wrong for every
+      // suffix but the narrowest: Inter's M advances 1.51x a tabular digit
+      // (27.1px against 18px at 30px), so in a 0.8 cell its ink overhung by
+      // 3.7px on each side and crowded the digit in front of it — "4.12M" read
+      // as "4.12 M". The cell carries the glyph's advance, not its ink, so the
+      // trailing gap after it is one gap rather than a space-width hole.
+      const w = advance * (ODO_STATIC_WIDTH[cell.ch] ?? 1);
       parts.push(
         `<text x="${(cursor + w / 2).toFixed(2)}" y="${baseline.toFixed(2)}" text-anchor="middle" font-size="${fontSize}" font-weight="${weight}" fill="${fill}">${escapeXml(cell.ch)}</text>`,
       );
@@ -694,14 +745,19 @@ function odometerSvg(opts: {
     }
     const slot = digitSlot++;
 
-// This cell's digit at rest, derived exactly as Counter.jsx does:
+    // This cell's digit at rest, derived exactly as Counter.jsx does:
     // Math.floor(value / place) % 10. The strip is laid out so that digit sits
     // on the baseline.
     const strip = odoStrip(target / cell.place);
+    // Only the rows the roll can reveal are emitted. The clip window hangs 4*k
+    // below the baseline while rows sit ODO_PITCH*k apart, and both scale with
+    // the font, so the hang stays 0.13 of a pitch at every size: a row above the
+    // target can never enter the window. That was 10 rows per cell where the
+    // average target needs 6, and the rows were a third of the payload.
     const rows: string[] = [];
-    for (let d = 0; d < 10; d++) {
+    for (let d = 0; d <= strip.digit; d++) {
       rows.push(
-        `<text x="${cursor.toFixed(2)}" y="${(baseline + strip.y(d) * pitch).toFixed(2)}" font-size="${fontSize}" font-weight="${weight}" fill="${fill}">${d}</text>`,
+        `<text x="${cursor.toFixed(2)}" y="${(baseline + strip.y(d) * pitch).toFixed(2)}">${d}</text>`,
       );
     }
     // Glyph d sits at (d - restDigit) * pitch, so translating by the negation
@@ -710,7 +766,15 @@ function odometerSvg(opts: {
     const restDigit = strip.digit;
     const frames: string[] = [];
     const times: number[] = [];
-    const steps = 240;
+    // Samples across the roll, chosen by how far the painted line can stray from
+    // the curve between two of them. Worst case (a strip travelling nine pitches):
+    // 240 steps -> 0.010px, 60 -> 0.157px, 24 -> 0.96px. 60 keeps it under a
+    // sixth of a pixel and cuts the values/keyTimes lists from ~33KB to ~8KB.
+    //
+    // keySplines + calcMode="spline" would carry the ease in a few keyframes, but
+    // the curve below is a polynomial and SMIL's spline is a cubic Bezier, which
+    // cannot match it exactly — that would alter the roll's shape.
+    const steps = 60;
     // Each digit sweeps ONCE, from showing 0 to its final value: the offset is
     // `restDigit * pitch * (1 - progress)` — bounded by the digit's own value,
     // continuous, with no wrap to jump across.
@@ -731,7 +795,19 @@ function odometerSvg(opts: {
     // number cascades left to right. The slot is keyed to the DIGIT's position,
     // not its cell index: "." is static, and counting it doubled the gap across
     // the decimal point.
-    const delay = ODO_STAGGER * slot;
+    //
+    // The delay is capped so delay + ODO_SWEEP can never exceed 1. Left
+    // uncapped, slot 5 onwards started so late that `local` never reached 1
+    // before t=1, and fill="freeze" froze the strip PART WAY THROUGH its roll:
+    // a $1,234,568 cost left its last two digits at "0 0.60" and "0 6.35"
+    // against a 21.4px pitch, visibly half-rolled. It takes a 6th digit to show,
+    // so a $100,000+ cost or a #100000+ rank hit it.
+    //
+    // The cascade is untouched for the digits that fit (a 4-digit figure still
+    // cascades over 0 / 0.1 / 0.2 / 0.3). Past the cap the remaining digits
+    // start together and finish together, which reads as one wide group rolling
+    // rather than as a broken tail.
+    const delay = Math.min(ODO_STAGGER * slot, 1 - ODO_SWEEP);
     for (let s = 0; s <= steps; s++) {
       const t = s / steps;
       // Clamped: a digit whose slot starts late waits at its start offset until
@@ -764,28 +840,49 @@ function odometerSvg(opts: {
       times.push(1);
       frames.push(frames[0]);
     }
-    let values = frames.join(";");
-    let kt = times;
+    // Roll space [0,1] -> animation space. The animation holds at zero through
+    // ODO_DELAY as its first span, then rolls. `start` (a provider percent's own
+    // beat) pushes the roll further in, so a strip waiting for its row holds for
+    // longer — one hold, not two mechanisms.
+    //
+    // The flat stretch before the roll is bracketed by two equal values: the dedup
+    // above collapses it to one sample, and SMIL interpolates linearly, so the
+    // strip would creep toward its target during the wait.
     const start = opts.start ?? 0;
-    if (start > 0) {
-      // Map the whole strip timeline into [start, 1] and repeat the first frame
-      // at t=0, so each cell holds at zero until its row's beat arrives and
-      // then sweeps within the remaining window.
-      kt = [0, ...times.map((t) => start + (1 - start) * t)];
-      values = `${frames[0]};${values}`;
+    const rollStart = holdEnd + (1 - holdEnd) * start;
+    const at = (t: number) => rollStart + (1 - rollStart) * t;
+    const kt: number[] = [0, rollStart];
+    const values: string[] = [frames[0], frames[0]];
+    if (delay > 0) {
+      kt.push(at(delay));
+      values.push(frames[0]);
+    }
+    for (let i = 1; i < times.length; i++) {
+      kt.push(at(times[i]));
+      values.push(frames[i]);
     }
     const keyTimes = `keyTimes="${kt.map((t) => t.toFixed(4)).join(";")}"`;
     const clipId = `odo-${idSuffix}-${i}`;
     clips.push(
       `<clipPath id="${clipId}"><rect x="${(cursor - 1).toFixed(2)}" y="${(baseline - cellH).toFixed(2)}" width="${(advance + 2 * k).toFixed(2)}" height="${(cellH + 4 * k).toFixed(2)}"/></clipPath>`,
     );
-    // The strip's base transform is its first animation frame (0 showing), so
-    // the pre-begin wait reads as zero instead of the frozen target. animat-
-    // Transform replaces the attribute while running, so the base only shows
-    // during the delay, and fill="freeze" holds the target after.
-    const atRest = `translate(0 ${(strip.digit * pitch).toFixed(2)})`;
+    // The base transform is the strip's FINAL state — the target digit sitting on
+    // the baseline — because that is what a renderer with no SMIL support paints:
+    // it reads the static attribute and ignores the <animateTransform> entirely.
+    // Parked at "0 showing" instead, every such renderer showed 0.00B / $000 /
+    // #000 and empty bars forever: resvg, librsvg, ImageMagick, sharp, and every
+    // link-preview or OG-image generator that rasterizes rather than animates.
+    //
+    // The roll is preserved by starting the animation at 0s and holding at zero
+    // through ODO_DELAY inside its own timeline (see holdEnd above), so an SMIL
+    // renderer still shows zeros first and then rolls.
+    const atRest = "translate(0 0.00)";
+    // font-size/weight/fill are identical on every glyph of the cell, so they sit
+    // on the group and inherit. That was ~70 bytes repeated on each of the 10
+    // rows, which was a fifth of the whole payload.
+    const ink = `font-size="${fontSize}" font-weight="${weight}" fill="${fill}"`;
     parts.push(
-      `<g clip-path="url(#${clipId})"><g transform="${atRest}">${rows.join("")}<animateTransform attributeName="transform" type="translate" begin="${ODO_DELAY}s" dur="${duration}s" fill="freeze" values="${values}" ${keyTimes}/></g></g>`,
+      `<g clip-path="url(#${clipId})" ${ink}><g transform="${atRest}">${rows.join("")}<animateTransform attributeName="transform" type="translate" begin="0s" dur="${duration}s" fill="freeze" values="${values.join(";")}" ${keyTimes}/></g></g>`,
     );
     cursor += advance + gap;
   });
@@ -807,15 +904,20 @@ function odometerSvg(opts: {
  */
 function odoWidth(value: string, fontSize: number): number {
   const unit = fontSize / ODO_FONT;
+  const advance = ODO_ADVANCE * unit;
+  const gap = ODO_GAP * unit;
   let w = 0;
   for (const ch of value) {
-    w += ch >= "0" && ch <= "9" || ch === "#"
-      ? ODO_ADVANCE * unit + ODO_GAP * unit
-      : (ch === "." ? ODO_ADVANCE * unit * 0.34 : ODO_ADVANCE * unit * 0.8) + ODO_GAP * unit;
+    // Must mirror odometerSvg's cursor EXACTLY, or the dividers that hang off
+    // this width drift away from the figures they are meant to follow. "#" used
+    // to be special-cased here as a full digit while the renderer gave it 1.06x,
+    // which left this 0.8px narrow and pushed RANK under the panel on the widest
+    // row — so every static goes through the same table the renderer reads.
+    w += (ch >= "0" && ch <= "9" ? advance : advance * (ODO_STATIC_WIDTH[ch] ?? 1)) + gap;
   }
   // The cursor overshoots by one trailing gap; trim it so the measured width is
   // the glyph edge a divider should hang off.
-  return Math.max(0, w - ODO_GAP * unit);
+  return Math.max(0, w - gap);
 }
 
 function renderProfileCard(opts: {
@@ -914,12 +1016,17 @@ function renderProfileCard(opts: {
   const LABEL_GAP = 7;
   const barX = PANEL_X + LOGO + 5 + LABEL_W + LABEL_GAP;
   const pctX = RIGHT_EDGE;
-  // The odometer right-aligns by cell advance, but "%" ink is wider than the
-  // 5.0px static cell it sits in (measured ~9.4px of ink at 10.5px), so the
-  // glyph overhangs the grid's right edge by ~2.2px. The grid is pulled in by
-  // that overshoot so the % INK lands on the margin line, exactly as the old
+  // The odometer right-aligns by cell advance, so the grid's right edge is the
+  // right edge of the "%" CELL, not of its ink — and the two are 1.18px apart at
+  // this size (Inter's right side bearing). The grid is therefore anchored so
+  // that the INK, not the cell, lands on the margin line, exactly as the old
   // static right-anchored text did.
-  const PCT_BLEED = 2.2;
+  //
+  // Giving "%" its real advance (ODO_STATIC_WIDTH) flipped which side of the ink
+  // the cell edge fell on: in the old narrow 0.8 cell the ink overhung by 1.46px
+  // and the grid was pulled IN by that much; now the ink sits inside the cell's
+  // own right side bearing, so the grid is pushed OUT by the same amount.
+  const PCT_BLEED = -1.18;
   const bars = shares.length
     ? shares
         .map((s, i) => {
@@ -931,14 +1038,22 @@ function renderProfileCard(opts: {
           // window and mapped back onto the shared timeline.
           const start = barStart(i);
           const stop = Math.min(1, start + ODO_SWEEP);
-          // keyTimes must run 0 -> 1 or SMIL rejects the element outright, so
-          // the bar holds at zero until its turn and at full width after it.
-          const pts: string[] = ["0"];
-          const keys: number[] = [0];
+          // Same two-phase timeline as the digits: hold at zero until this row's
+          // beat, then grow to full width. keyTimes must run 0 -> 1 or SMIL
+          // rejects the element outright.
+          //
+          // The bar's base width is its FINAL value for the same reason the digit
+          // strips' base transform is the final digit: a renderer without SMIL
+          // reads the static attribute, and a base of 0 meant every provider row
+          // rendered as an empty track there.
+          const barDuration = ODO_DELAY + ODO_DURATION;
+          const barHoldEnd = ODO_DELAY / barDuration;
+          const pts: string[] = ["0", "0"];
+          const keys: number[] = [0, barHoldEnd];
           for (let s = 0; s <= BAR_SAMPLES; s++) {
             const local = s / BAR_SAMPLES;
             pts.push((full * springValueAt(local)).toFixed(2));
-            keys.push(start + (stop - start) * local);
+            keys.push(barHoldEnd + (1 - barHoldEnd) * (start + (stop - start) * local));
           }
           pts.push(full.toFixed(2));
           keys.push(1);
@@ -976,7 +1091,7 @@ function renderProfileCard(opts: {
           return `${providerLogoUse(s.label, PANEL_X, logoY, LOGO, p.logoInk)}
       <text x="${PANEL_X + LOGO + 5}" y="${y}" font-size="${ROW_FONT}" fill="${p.secondary}">${escapeXml(s.label)}</text>
       <rect x="${barX}" y="${barY}" width="${BAR_W}" height="${BAR_H}" rx="${BAR_H / 2}" fill="${p.barTrack}"/>
-      <rect x="${barX}" y="${barY}" width="0" height="${BAR_H}" rx="${BAR_H / 2}" fill="${s.color}" fill-opacity="${p.barOpacity[i]}"><animate attributeName="width" begin="${ODO_DELAY}s" dur="${ODO_DURATION}s" fill="freeze" values="${pts.join(";")}" keyTimes="${keys.map((t) => t.toFixed(4)).join(";")}" calcMode="linear"/></rect>
+      <rect x="${barX}" y="${barY}" width="${full.toFixed(2)}" height="${BAR_H}" rx="${BAR_H / 2}" fill="${s.color}" fill-opacity="${p.barOpacity[i]}"><animate attributeName="width" begin="0s" dur="${barDuration}s" fill="freeze" values="${pts.join(";")}" keyTimes="${keys.map((t) => t.toFixed(4)).join(";")}" calcMode="linear"/></rect>
       ${pctBody}`;
         })
         .join("\n    ")
@@ -1012,15 +1127,33 @@ function renderProfileCard(opts: {
   // no fixed x serves all of them.
   //
   // Packing the columns tight would just move the hole to the far end, so the
-  // three gaps share whatever room is left between the gutter and the panel.
-  // COL_GAP is a floor, and load-bearing: without it the widest case (400px of
-  // figures) drives the gap negative and runs RANK into the panel.
-  const COL_GAP = 20; // floor; the real gap grows when there is room to spare
-  const tokW = odoWidth(tokens, ODO_FONT);
-  const costW = odoWidth(cost, 21);
-  const rankW = odoWidth(rank, 21);
-  const slack = PANEL_X - TEXT_X - tokW - costW - rankW;
-  const colGap = Math.max(COL_GAP, slack / 3);
+  // gaps share whatever room is left between the gutter and the panel.
+  //
+  // The widest printable row needs ~395px of figures in a 410px span, which leaves
+  // too little for two gaps AND a margin — letting the gaps go to zero left RANK
+  // touching the panel. So the figures shrink to make room. Scale only ever goes
+  // DOWN, so an ordinary row keeps the 30px/21px hierarchy and the tuned baselines.
+  const MIN_GAP = 8;          // the row may compress its gaps to this, not below
+  const PANEL_CLEARANCE = 8; // daylight the row must leave before the panel
+  const SMALL = 21;          // the COST/RANK size; TOKENS is ODO_FONT
+  // A digit strip's clip window starts 1px left of its cell and is 2*k wider, so
+  // it overhangs the cell by (2*k - 1) on the right. The window is what confines
+  // the digits, so it is what must stay clear of the panel — not just the cell.
+  const clipOverhang = 2 * (SMALL / ODO_FONT) - 1;
+  const widest = odoWidth(tokens, ODO_FONT) + odoWidth(cost, SMALL) + odoWidth(rank, SMALL);
+  const room = PANEL_X - TEXT_X - clipOverhang - PANEL_CLEARANCE - MIN_GAP * 2;
+  const scale = widest <= room ? 1 : room / widest;
+  const smallFont = SMALL * scale;
+  const tokFont = ODO_FONT * scale;
+  const tokW = odoWidth(tokens, tokFont);
+  const costW = odoWidth(cost, smallFont);
+  const rankW = odoWidth(rank, smallFont);
+  const slack = PANEL_X - TEXT_X - clipOverhang - PANEL_CLEARANCE - tokW - costW - rankW;
+  // Three gaps' worth of slack, so a narrow row spreads its figures out instead of
+  // huddling at the gutter and leaving a hole before the panel. The floor is what
+  // a crowded row falls back to; it is never allowed to squeeze the row under the
+  // panel, because the figures have already shrunk to make room for MIN_GAP.
+  const colGap = Math.max(MIN_GAP, slack / 3);
   const costX = TEXT_X + tokW + colGap;
   const rankX = costX + costW + colGap;
   const div1 = costX - colGap / 2;
@@ -1039,11 +1172,11 @@ function renderProfileCard(opts: {
     <text x="550" y="${brandBaseline.toFixed(2)}" font-size="${BRAND_FONT}" font-weight="600" letter-spacing="2.2" fill="${p.accent}" text-anchor="end">TOKENTRACKER</text>
     <text x="550" y="${brandSubBaseline.toFixed(2)}" font-size="${BRAND_FONT}" fill="${p.faint}" text-anchor="end">tokentracker.cc</text>
 
-    ${stat(TEXT_X, "TOKENS", tokens, ODO_FONT, 700, p.fg, Number(row.total_tokens ?? 0), "tok")}
+    ${stat(TEXT_X, "TOKENS", tokens, tokFont, 700, p.fg, Number(row.total_tokens ?? 0), "tok")}
     <line x1="${div1.toFixed(2)}" y1="106" x2="${div1.toFixed(2)}" y2="152" stroke="${p.divider}"/>
-    ${stat(costX, "COST", cost, 21, 600, p.fg, Number(row.estimated_cost_usd ?? 0), "cost")}
+    ${stat(costX, "COST", cost, smallFont, 600, p.fg, Number(row.estimated_cost_usd ?? 0), "cost")}
     <line x1="${div2.toFixed(2)}" y1="106" x2="${div2.toFixed(2)}" y2="152" stroke="${p.divider}"/>
-    ${stat(rankX, "RANK", rank, 21, 600, p.accent, row.rank ?? 0, "rank")}
+    ${stat(rankX, "RANK", rank, smallFont, 600, p.accent, row.rank ?? 0, "rank")}
 
     <text x="${PANEL_X}" y="104" font-size="9.5" font-weight="600" letter-spacing="1.8" fill="${p.muted}">TOP PROVIDERS</text>
     ${bars}

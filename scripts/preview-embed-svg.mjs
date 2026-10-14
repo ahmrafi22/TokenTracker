@@ -24,14 +24,18 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Node 20 satisfies `engines.node` but cannot strip types off a .ts import, and
-// the failure it produces is an opaque ERR_UNKNOWN_FILE_EXTENSION. Fail here
-// with something that names the actual cause instead.
-const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
-if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 6)) {
+// Importing the edge file needs native TypeScript stripping, which
+// `engines.node: ">=20"` does not guarantee — Node 20 cannot do it at all, and
+// the failure it produces is an opaque ERR_UNKNOWN_FILE_EXTENSION. Ask Node
+// itself rather than parsing a version string: `process.features.typescript` is
+// "strip" only when stripping is actually active, which covers both routes (on
+// by default from Node 22.18, or --experimental-strip-types in 22.6-22.17).
+if (process.features.typescript !== "strip") {
   console.error(
-    `preview-embed-svg.mjs needs Node >= 22.6 for native TypeScript stripping; ` +
-      `this is ${process.versions.node}.`,
+    `preview-embed-svg.mjs needs Node's TypeScript stripping to import the edge ` +
+      `file: Node ${process.versions.node} reports ` +
+      `typescript=${process.features.typescript ?? "unavailable"}. ` +
+      `Use Node 22.18+ (or 22.6-22.17 with --experimental-strip-types).`,
   );
   process.exit(1);
 }

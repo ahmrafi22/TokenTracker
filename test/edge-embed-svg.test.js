@@ -10,20 +10,33 @@
 //
 // The renderers are pure functions, so the module loads the same way
 // scripts/preview-embed-svg.mjs loads it: Node strips the TypeScript types
-// natively (>= 22.6), the `npm:@insforge/sdk` import is dropped, and Deno.env
-// is stubbed. No build step and no dependencies — unlike
-// edge-pricing-parity.test.js, which needs esbuild from node_modules.
+// natively, the `npm:@insforge/sdk` import is dropped, and Deno.env is stubbed.
+// No build step and no dependencies — unlike edge-pricing-parity.test.js, which
+// needs esbuild from node_modules.
+//
+// That needs type stripping, which package.json's `engines.node: ">=20"` does
+// not guarantee: Node 20 cannot import a .ts file at all, and every test here
+// failed in the shared `before` hook with ERR_UNKNOWN_FILE_EXTENSION. The suite
+// skips itself instead, rather than reporting a false failure on a version the
+// project says it supports. Stripping is default-on from Node 22.18; 22.6-22.17
+// need --experimental-strip-types, which process.features.typescript reflects.
 
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { test, before } = require("node:test");
+const { test: nodeTest, before } = require("node:test");
 const assert = require("node:assert");
 const { pathToFileURL } = require("node:url");
 
 const ROOT = path.join(__dirname, "..");
 const EDGE_FILE = path.join(ROOT, "dashboard", "edge-patches", "tokentracker-embed-svg.ts");
 const EXPORTS = ["renderProfileCard", "placeholderSvg", "PALETTE"];
+
+// "strip" covers both routes: enabled by default from 22.18, or switched on with
+// --experimental-strip-types in 22.6-22.17. Anything else cannot load the edge
+// file, so the whole suite is skipped rather than failing at import.
+const CAN_STRIP_TYPES = process.features.typescript === "strip";
+const test = CAN_STRIP_TYPES ? nodeTest : nodeTest.skip;
 
 let api;
 
@@ -172,6 +185,82 @@ test("every gradient and clip-path reference resolves", () => {
   }
 });
 
+// What a renderer with NO SMIL support paints: the static attributes, with every
+// <animate*> removed. These cover resvg, librsvg, ImageMagick and sharp, plus
+// every link-preview / OG-image generator that rasterizes rather than animates.
+//
+// The digits must be readable off the BASE transform alone, and the base must
+// therefore hold each strip's FINAL value — not the "0 showing" frame the roll
+// starts from. Parked at the zero frame, every one of those renderers showed
+// 0.00B / $000 / #000 and empty bars forever.
+// A digit cell as the renderer emits it: the shared ink (font-size, font-weight,
+// fill) lives on the clip group and is inherited by the glyph rows, and a cell
+// carries only the rows its roll actually travels through. Both the attribute set
+// and the row count therefore vary per cell, so match them structurally rather
+// than hardcoding one shape.
+const cellRe = (suffix) =>
+  new RegExp(
+    '<g clip-path="url\\(#odo-' + suffix + '-\\d+\\)"([^>]*)>' +
+      '<g transform="translate\\(0 (-?[\\d.]+)\\)">' +
+      '((?:<text[^>]*>\\d</text>)+)',
+    "g",
+  );
+const ink = (attrs) => ({
+  fontSize: Number(/font-size="([\d.]+)"/.exec(attrs)?.[1]),
+  weight: /font-weight="([^"]+)"/.exec(attrs)?.[1],
+  fill: /fill="([^"]+)"/.exec(attrs)?.[1],
+});
+
+test("the card is correct without SMIL, not just while animating", () => {
+  // Strip the animations; what is left is what a non-SMIL renderer draws.
+  const staticCard = (svg) => svg.replace(/<animate(?:Transform)?\b[^>]*\/>/g, "");
+
+  // Digit strips as painted statically: glyph d is authored at
+  // baseline + (d - restDigit) * pitch, so the glyph ON the baseline is the
+  // target digit once the base transform is applied. The sign matters — a strip
+  // whose rest digit is high puts its top glyph at a negative y, above the card.
+  const staticDigits = (svg, suffix) => {
+    const baseline = suffix === "tok" ? 150 : 149;
+    let out = "";
+    for (const c of svg.matchAll(cellRe(suffix))) {
+      const rows = [...c[3].matchAll(/y="(-?[\d.]+)"/g)].map((m) => Number(m[1]));
+      const on = rows.findIndex((y) => Math.abs(y - baseline) < 0.05);
+      out += on >= 0 ? String(on) : "?";
+    }
+    return out;
+  };
+
+  for (const [label, overrides] of [
+    ["mock row", {}],
+    ["wide cost", { estimated_cost_usd: 1234567.89 }],
+  ]) {
+    const svg = staticCard(hero(overrides));
+    const title = /<title>[^<]*<\/title>/.exec(hero(overrides))[0];
+
+    // Cost is compact above a million, so it can end in a suffix ("$1.23M") as
+    // well as carrying separators. Strip both — the odometer's cells are digits
+    // either way, and the title is the authority on what they should read.
+    const wantCost = /\$[\d.,]+[A-Z]?/.exec(title)[0].replace(/\D/g, "");
+    assert.equal(
+      staticDigits(svg, "cost"),
+      wantCost,
+      `${label}: COST reads wrong without SMIL — a non-SMIL renderer would print the wrong figure`,
+    );
+
+    // A provider bar's BASE width is its full width; only the animation grows
+    // it. Matched on the <animate attributeName="width"> child, so the dim
+    // background track of each pair is not mistaken for the bar itself.
+    const animated = hero(overrides);
+    const fills = [...animated.matchAll(
+      /<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)"[^>]*><animate attributeName="width"/g,
+    )].map((m) => Number(m[1]));
+    assert.equal(fills.length, 3, `${label}: expected three animated provider bars`);
+    for (const w of fills) {
+      assert.ok(w > 0, `${label}: a provider bar has base width 0 — it renders as an empty track without SMIL`);
+    }
+  }
+});
+
 // Each figure is drawn as an odometer — one <text> per stacked glyph, not one
 // run of text — so its settled value is reconstructed from each cell's resting
 // glyph. `suffix` picks the stat ("tok", "cost", "rank"); TOKENS sits on
@@ -179,8 +268,9 @@ test("every gradient and clip-path reference resolves", () => {
 function settledFor(svg, suffix) {
   const baseline = suffix === "tok" ? 150 : 149;
   const CELL = new RegExp(
-    '<g clip-path="url\\(#odo-' + suffix + '-\\d+\\)"><g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
-      '(?:<text[^>]*>\\d</text>){10}' +
+    '<g clip-path="url\\(#odo-' + suffix + '-\\d+\\)"[^>]*>' +
+      '<g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
+      '(?:<text[^>]*>\\d</text>)+' +
       '<animateTransform[^>]*values="[^"]*"[^>]*\\/?>' +
       '</g></g>',
     "g",
@@ -229,6 +319,51 @@ const settledTokens = (svg) => settledFor(svg, "tok");
 // Strip pitch, authored at the 30px TOKENS size. The 21px figures scale it by
 // 0.7, so the skip checks compare against each cell's own pitch.
 const ODO_PITCH = 30.6;
+const ODO_CELL_H = 23;   // clip height at the authored size; the window adds 4*k
+const ODO_OVERHANG = 4;  // how far the clip window hangs below the baseline, x k
+
+test("a strip emits exactly the rows its clip window can reveal", () => {
+  // The renderer drops the rows above a cell's target digit. That is only safe
+  // while the window hangs less than one pitch below the baseline, and both
+  // scale with the font, so the ratio is fixed at every size. Pin that ratio
+  // first: if it ever reaches 1, a dropped row could peek in and this whole
+  // optimisation silently changes what is drawn.
+  assert.ok(
+    ODO_OVERHANG < ODO_PITCH,
+    `the clip window hangs ${ODO_OVERHANG}*k but rows sit ${ODO_PITCH}*k apart — a row above the target could now show`,
+  );
+
+  // Then confirm the emitted rows are exactly 0..restDigit on rows that shrink the
+  // figures hardest, where a smaller pitch brings the window closest to the next row.
+  const rowsOf = (svg, suffix) =>
+    [...svg.matchAll(cellRe(suffix))].map((c) => [...c[3].matchAll(/>(\d)</g)].map((m) => Number(m[1])));
+
+  for (const overrides of [
+    {},
+    { total_tokens: 999.99e12, estimated_cost_usd: 99_990_000, rank: 1_111_111_111_111 },
+    { total_tokens: 0, estimated_cost_usd: 0, rank: 9 },
+    { total_tokens: 987_654_321, estimated_cost_usd: 987_654.32, rank: 987_654 },
+  ]) {
+    const svg = hero(overrides);
+    for (const suffix of ["tok", "cost", "rank"]) {
+      for (const rows of rowsOf(svg, suffix)) {
+        assert.ok(rows.length > 0, `${suffix}: a cell emitted no rows at all`);
+        // Contiguous from 0, no gaps.
+        assert.deepEqual(
+          rows,
+          rows.map((_, i) => i),
+          `${suffix}: rows must be 0..rest with nothing skipped, got ${rows.join(",")}`,
+        );
+      }
+    }
+  }
+
+  // The digit resting on the baseline is the last row emitted — if the trim ever
+  // stopped short, the card would settle one digit short of its target.
+  const settled = [...hero({ total_tokens: 987_654_321, estimated_cost_usd: 987_654.32, rank: 987_654 })
+    .matchAll(cellRe("rank"))].map((c) => Number([...c[3].matchAll(/>(\d)</g)].pop()[1]));
+  assert.equal(settled.join(""), "987654", "the rank strip must still reach every digit of its target");
+});
 
 // The digit timing tests look at the TOKENS odometer only: COST and RANK carry
 // their own copies, so scanning every cell would count 10 and blur which figure
@@ -241,6 +376,155 @@ function tokCells(svg) {
     return lastClip >= 0 && svg.startsWith('id="odo-tok-', lastClip);
   });
 }
+
+test("every digit strip finishes its roll, however many digits the figure has", () => {
+  // The per-digit stagger was a flat ODO_STAGGER * slot, so from the 6th digit
+  // the sweep ran past the end of the timeline and fill="freeze" froze it PART
+  // WAY THROUGH: a $1,234,568 cost left its last two strips at "0 0.60" and
+  // "0 6.35" against a 21.4px pitch, visibly half-rolled. settledFor() could not
+  // see it because it rebuilds digits from the untransformed glyph rows and
+  // ignores the frozen offset entirely.
+  //
+  // So assert on the offset itself: the LAST value of every animateTransform must
+  // be exactly "0 0.00" — the resting glyph, parked on the baseline.
+  const CASES = [
+    ["4 digits", {}],
+    // 7 digits, the shape that broke it. (Cost compacts above a million, so this
+    // is "$1.23M" — 4 digits. The RANK below is what carries 7.)
+    ["wide cost", { estimated_cost_usd: 1234567.89 }],
+    ["wide rank", { rank: 1234567 }],
+    ["both wide", { estimated_cost_usd: 1234567.89, rank: 1234567 }],
+  ];
+  for (const [label, overrides] of CASES) {
+    for (const svg of [hero(overrides), hero(overrides, "light")]) {
+      for (const m of svg.matchAll(
+        /<g clip-path="url\(#odo-[a-z0-9]+-\d+\)">[\s\S]*?<animateTransform[^>]*values="([^"]*)"/g,
+      )) {
+        const values = m[1].split(";");
+        const id = /url\(#(odo-[a-z0-9]+-\d+)\)/.exec(m[0])[1];
+        assert.equal(
+          values.at(-1),
+          "0 0.00",
+          `${label}: ${id} freezes at "${values.at(-1)}" instead of settling on its digit`,
+        );
+      }
+    }
+  }
+});
+
+test("a unit suffix is not crowded by the digit in front of it", () => {
+  // Static cells were all 0.8 * advance, but Inter's M advances 1.51x a digit
+  // (27.1px against 18px at 30px). In a 0.8 cell its ink overhung by ~3.7px on
+  // each side and ran into the last digit — "4.12M" read as "4.12 M". Each
+  // glyph now gets its real advance, so the ink stays inside its own cell.
+  //
+  // Measured from Inter's hmtx/glyf at 30px: advance as a multiple of a digit's.
+  const ADVANCE = { M: 1.506, B: 1.09, K: 1.12, T: 1.076 };
+  const DIGIT_INK = 15.35;   // Inter's widest digit ink at 30px ("0")
+  const CASES = [
+    ["B", {}],
+    ["M", { total_tokens: 4_120_000 }],
+    ["K", { total_tokens: 812_400 }],
+    // "T" needs 1e12 tokens (compactNumber's trillion threshold).
+    ["T", { total_tokens: 1_250_000_000_000 }],
+  ];
+  for (const [suffix, overrides] of CASES) {
+    const svg = hero(overrides);
+    const suffixNode = [...svg.matchAll(
+      /<text x="([\d.]+)" y="150\.00" text-anchor="middle"[^>]*>([A-Z])<\/text>/g,
+    )].find((m) => m[2] === suffix);
+    assert.ok(suffixNode, `no "${suffix}" suffix on the TOKENS row`);
+    const centre = Number(suffixNode[1]);
+    const cellLeft = centre - (18 * ADVANCE[suffix]) / 2;
+    const cells = [...svg.matchAll(/odo-tok-\d+"><rect x="([\d.]+)"/g)].map((m) => Number(m[1]));
+    const lastDigit = cells[cells.length - 1];
+    // The suffix CELL must start clear of the previous digit's INK. A little
+    // clearance is required; the old layout put this at or below zero.
+    const gap = cellLeft - lastDigit - DIGIT_INK;
+    assert.ok(
+      gap > 1,
+      `"${suffix}"'s cell starts ${gap.toFixed(2)}px from the digit's ink — it crowds it`,
+    );
+  }
+});
+
+test("a strip holds still during its wait, then follows the ease-out", () => {
+  // SMIL interpolates LINEARLY between keyframes, so a stretch of the curve that
+  // is genuinely flat must be bracketed by two EQUAL values or it renders as a
+  // straight line. The sample dedup collapses the whole flat wait to a single
+  // keyframe, which meant the strip crept toward its target before its turn — the
+  // opposite of the hold — and the creep grew as the sample count came down.
+  //
+  // Read back through the renderer's own linear map, every strip's painted path
+  // is compared against the exact curve it is supposed to draw:
+  //   rest * (1 - (1 - t)^3) * pitch, held flat until `delay`, rolling over SWEEP.
+  const SPRING = (t) => 1 - (1 - t) ** 3;
+  const STAGGER = 0.1, SWEEP = 0.6, PITCH = ODO_PITCH;
+  const paint = ({ v, k }, keyTime) => {
+    if (keyTime <= k[0]) return v[0];
+    if (keyTime >= k[k.length - 1]) return v.at(-1);
+    for (let i = 1; i < k.length; i++) {
+      if (keyTime <= k[i]) {
+        const span = k[i] - k[i - 1];
+        return v[i - 1] + (v[i] - v[i - 1]) * (span === 0 ? 0 : (keyTime - k[i - 1]) / span);
+      }
+    }
+    return v.at(-1);
+  };
+
+  for (const [label, overrides] of [
+    ["mock", {}],
+    ["widest", { total_tokens: 999.99e12, estimated_cost_usd: 99999999, rank: 1234567 }],
+  ]) {
+    const svg = hero(overrides);
+    const strips = [...svg.matchAll(
+      /<g clip-path="url\(#odo-tok-(\d+)\)"[^>]*><g transform="[^"]*">(?:<text[^>]*>\d<\/text>)+<animateTransform[^>]*values="([^"]*)"[^>]*keyTimes="([^"]*)"/g,
+    )];
+    assert.ok(strips.length, `${label}: no TOKENS strips found`);
+
+    let slot = 0;
+    for (const m of strips) {
+      // Only digit cells have a strip, so every match is one animated digit and
+      // the stagger slot simply counts them in document order. (Static cells —
+      // the "." and the unit suffix — carry no strip and never match here.)
+      const s = {
+        v: m[2].split(";").map((x) => Number(x.trim().split(/\s+/)[1])),
+        k: m[3].split(";").map(Number),
+        // The strip's own row spacing IS its pitch, and it is not always
+        // ODO_PITCH: a row too wide for the panel shrinks its figures, so the
+        // pitch scales with them. Reading it off the rows is the only way to get
+        // the resting digit — dividing by the unscaled pitch gave 8.788 for a
+        // digit that is really a 9.
+        pitch: (() => {
+          const ys = [...m[0].matchAll(/<text[^>]*y="(-?[\d.]+)"/g)]
+            .slice(0, 2)
+            .map((y) => Number(y[1]));
+          return Math.abs(ys[1] - ys[0]);
+        })(),
+      };
+      const rest = Math.round(s.v[0] / s.pitch);
+      const delay = Math.min(STAGGER * slot++, 1 - SWEEP);
+      // The renderer's own map: roll space [0,1] -> keyTime.
+      const at = (t) => s.k[1] + (1 - s.k[1]) * t;
+
+      for (let i = 0; i <= 300; i++) {
+        const t = (i / 300) * delay;
+        assert.ok(
+          Math.abs(paint(s, at(t)) - rest * s.pitch) < 0.5,
+          `${label}: strip moves ${Math.abs(paint(s, at(t)) - rest * s.pitch).toFixed(2)}px during its wait - it must hold`,
+        );
+      }
+      for (let i = 0; i <= 900; i++) {
+        const t = delay + (i / 900) * SWEEP;
+        const want = rest * (1 - SPRING(Math.min(1, (t - delay) / SWEEP))) * s.pitch;
+        assert.ok(
+          Math.abs(paint(s, at(t)) - want) < 1,
+          `${label}: strip is ${Math.abs(paint(s, at(t)) - want).toFixed(2)}px off the curve mid-roll`,
+        );
+      }
+    }
+  }
+});
 
 test("hero card renders the mock snapshot values", () => {
   const svg = hero();
@@ -285,6 +569,63 @@ test("the odometer settles on the rounded figure, not the raw value", () => {
       assert.equal(settledFor(svg, "cost"), expected, `${label} cost settles on the wrong value`);
     }
   }
+});
+
+test("a crowded stat row leaves visible daylight before the provider panel", () => {
+  // Not merely "does not overlap" — a row that fills every pixel up to the panel
+  // reads as a collision even at exactly 0px, which is where letting the gaps go
+  // to zero left the widest row. The figures now shrink so the row always keeps a
+  // real margin, and this pins that margin.
+  const PANEL_X = 438;
+  const MIN_CLEARANCE = 6;
+  // The widest printable row: every figure at its maximum width at once.
+  const CASES = [
+    ["widest", { total_tokens: 999.99e12, estimated_cost_usd: 99_990_000, rank: 9999999 }],
+    ["12-digit rank", { total_tokens: 999.99e12, estimated_cost_usd: 99_990_000, rank: 1_111_111_111_111 }],
+    ["unbounded cost", { estimated_cost_usd: 1e15, rank: 1_111_111_111_111 }],
+    ["wide cost", { estimated_cost_usd: 9_999_999, rank: 9999999 }],
+    ["ordinary", {}],
+    ["narrow", { total_tokens: 1e6, estimated_cost_usd: 0, rank: 1 }],
+  ];
+  for (const [label, over] of CASES) {
+    for (const svg of [hero(over), hero(over, "light")]) {
+      const right = Math.max(
+        ...[...svg.matchAll(/<clipPath id="odo-(?:tok|cost|rank)-\d+"><rect x="([\d.]+)"[^>]*width="([\d.]+)"/g)]
+          .map((m) => Number(m[1]) + Number(m[2])),
+        // A figure with no digits (a zero cost, a missing rank) is plain text.
+        ...[...svg.matchAll(/<text x="([\d.]+)" y="1[45]9"[^>]*>[$#—]/g)].map((m) => Number(m[1]) + 12),
+      );
+      assert.ok(
+        PANEL_X - right >= MIN_CLEARANCE,
+        `${label}: stat row reaches ${right.toFixed(1)}, leaving only ${(PANEL_X - right).toFixed(1)}px before the panel at ${PANEL_X}`,
+      );
+    }
+  }
+});
+
+test("a crowded stat row shrinks its figures instead of crowding the panel", () => {
+  // The row must fit however wide its figures get, and rank is unbounded — a
+  // 12-digit rank is more than the gutter-to-panel span leaves once two usable
+  // gaps and a real margin are reserved. formatCost now compacts above a million,
+  // so COST is bounded; RANK is not, and this is the case that exercises the
+  // shrink. The figures scale down as one piece, keeping the 30:21 hierarchy, and
+  // ordinary rows are untouched.
+  // TOKENS carries the biggest figure, so its cell's font size is the row's. The
+  // size is read off the cell's own group, where the shared ink is declared.
+  const fonts = (svg) => ink([...svg.matchAll(cellRe("tok"))][0][1]).fontSize;
+  const WIDEST = { total_tokens: 999.99e12, estimated_cost_usd: 99_990_000, rank: 1_111_111_111_111 };
+  const ordinary = fonts(hero());
+  const crowded = fonts(hero(WIDEST));
+  assert.equal(ordinary, 30, "an ordinary row should render TOKENS at its tuned size");
+  assert.ok(crowded < ordinary, `a 12-digit rank should shrink below ${ordinary}px, got ${crowded}`);
+  assert.ok(crowded > ordinary * 0.85, `TOKENS shrank too far: ${crowded}px`);
+  // A 10-digit rank still fits at full size — the shrink must not engage early.
+  assert.equal(fonts(hero({ ...WIDEST, rank: 1_111_111_111 })), 30, "a row that fits should not shrink");
+  // COST and RANK must keep their ratio to TOKENS, or the row loses its hierarchy.
+  const sizes = (svg) =>
+    ["tok", "cost", "rank"].map((s) => ink([...svg.matchAll(cellRe(s))][0][1]).fontSize);
+  const [big, small] = sizes(hero(WIDEST));
+  assert.ok(Math.abs(small / big - 21 / 30) < 0.01, `the 30:21 hierarchy changed on a crowded row (ratio ${(small / big).toFixed(3)})`);
 });
 
 test("hero card escapes XML in the display name", () => {
@@ -398,12 +739,23 @@ test("the stat dividers follow the figures instead of a fixed x", () => {
 
 test("the stat row never collides with the provider panel", () => {
   // Spreading the slack across the columns could, on a crowded row, run RANK
-  // into the provider bars at x=452. Checked on the widest printable values,
-  // the narrowest, and the all-static fallback.
-  const PANEL_X = 452;
+  // into the provider bars. Checked on the widest printable values, the
+  // narrowest, and the all-static fallback.
+  //
+  // PANEL_X must be the renderer's 438 — the test used to assume 452, which is
+  // 14px of optimism that hid a real collision. The widest row is the one whose
+  // figures are all at their maximum print width at once, not a case with a
+  // narrow rank: COL_GAP is a floor, so it was the three-wide row that ran under
+  // the panel.
+  const PANEL_X = 438;
   const cases = [
-    ["mock", {}, 65],
-    ["widest", { total_tokens: 999.99e12, estimated_cost_usd: 99999, rank: 12345 }, 25],
+    ["mock", {}, 60],
+    // 999.99T / $99,999,999 / #1234567 — every figure at its widest print. Note
+    // the cost has to be 99999999, not 99999: formatCost renders >= 1000 as a
+    // comma-grouped integer, so 99999.99 prints "$100,000" and is far narrower
+    // than the "$99,999,999" that actually stresses the row.
+    ["widest", { total_tokens: 999.99e12, estimated_cost_usd: 99999999, rank: 1234567 }, 0],
+    ["wide cost, short rank", { estimated_cost_usd: 12345.67, rank: 7 }, 20],
     ["narrowest", { total_tokens: 1e6, estimated_cost_usd: 0, rank: 1 }, 25],
     ["zero", { total_tokens: 0, estimated_cost_usd: 0, rank: null }, 0],
   ];
@@ -497,7 +849,7 @@ test("digits are set tightly, not tracked out", () => {
   const dotX = Number(statics[0][1]);
   // Measure the dot's CELL, not its ink centre: the digit cells give x at their
   // left edge, so comparing against the dot's centre would mix two origins.
-  const dotW = 18 * 0.34;               // the "." cell, as odometerSvg sizes it
+  const dotW = 18 * 0.48;               // the "." cell, as odometerSvg sizes it
   const dotLeft = dotX - dotW / 2;
   const dotRight = dotX + dotW / 2;
   const dotCells = [...hero().matchAll(/odo-tok-\d+"><rect x="([\d.]+)"/g)].map((m) => Number(m[1]));
@@ -554,16 +906,18 @@ test("provider rows centre the bar and logo on the label's cap line", () => {
   assert.ok(barX - labelX >= 40, `only ${(barX - labelX).toFixed(1)}px between label and bar`);
 
   // The heading/share panel, the percent column, and the brand lockup share
-  // one right margin: the percentages' INK lands on the bolt tile's right
-  // edge. The odometer right-aligns by cell advance, so the grid is pulled in
-  // by the "%" ink overshoot (2.2px) and the static "%" glyph's grid edge —
-  // its centre plus half the 18*k*0.8 cell — sits that far inside the margin.
+  // one right margin: the percentages' INK lands on the bolt tile's right edge.
+  // The odometer right-aligns by cell advance, so the grid's right edge is the
+  // "%" CELL's right edge — its centre plus half its advance — and the ink sits
+  // 1.18px inside that cell (Inter's right side bearing at this size). PCT_BLEED
+  // pushes the grid out by exactly that much so the INK, not the cell, meets the
+  // margin line.
   const tileRight = Number(svg.match(/<rect x="([\d.]+)" y="[\d.]+" width="22" height="22"[^>]*fill="url\(#tt-tile-22\)"/)[1]) + 22;
   const pctCentre = Number(svg.match(/<text x="([\d.]+)" y="124\.00" text-anchor="middle"[^>]*>%<\/text>/)[1]);
-  const gridRight = pctCentre + (18 * 0.8 * (10.5 / 30)) / 2;
+  const gridRight = pctCentre + (18 * 1.637 * (10.5 / 30)) / 2;
   assert.ok(
-    Math.abs(gridRight - (tileRight - 2.2)) < 0.6,
-    `percent grid ends at ${gridRight.toFixed(2)}; expected ${tileRight - 2.2} (tile edge ${tileRight} less the % bleed)`,
+    Math.abs(gridRight - (tileRight + 1.18)) < 0.6,
+    `percent grid ends at ${gridRight.toFixed(2)}; expected ${tileRight + 1.18} (tile edge ${tileRight} plus the % ink's right side bearing)`,
   );
 
   // The heading and the logo column share a left edge.
@@ -584,18 +938,25 @@ test("provider percentages count up on the odometer and rest at their value", ()
   // SMIL animation — values and keyTimes equal length, keyTimes 0 -> 1 — even
   // though it has no travel. A malformed single-frame animate is the failure
   // mode that silently disables the whole strip.
+  //
+  // "No travel" is read off the VALUES now, not the base transform: the base
+  // holds the strip's final state (so a renderer without SMIL still shows the
+  // right digit), which means it reads 0 for every strip and no longer
+  // distinguishes them. A zero-target digit is the one whose every value is the
+  // same resting offset.
   let held = 0;
   for (const m of svg.matchAll(
-    /<g clip-path="url\(#odo-p\d-\d\)"><g transform="translate\(0 ([\d.]+)\)">(?:<text[^>]*>\d<\/text>){10}<animateTransform[^>]*values="([^"]*)"[^>]*keyTimes="([^"]*)"/g,
+    /<g clip-path="url\(#odo-p\d-\d\)"[^>]*><g transform="translate\(0 ([\d.]+)\)">(?:<text[^>]*>\d<\/text>)+<animateTransform[^>]*values="([^"]*)"[^>]*keyTimes="([^"]*)"/g,
   )) {
     const vals = m[2].split(";");
     const kt = m[3].split(";").map(Number);
     assert.equal(vals.length, kt.length, "values and keyTimes must agree in length");
     assert.equal(kt[0], 0, "a strip's keyTimes must start at 0");
     assert.equal(kt[kt.length - 1], 1, "a strip's keyTimes must end at 1");
-    if (Number(m[1]) === 0) {
+    if (new Set(vals).size === 1) {
       held++;
-      assert.equal(new Set(vals).size, 1, "a zero digit must hold its resting glyph");
+      assert.equal(Number(m[1]), 0, "a strip that never moves must rest at its final offset");
+      assert.equal(vals.at(-1), "0 0.00", "a zero digit must settle on the baseline");
     }
   }
   assert.ok(held >= 1, "expected a percent row to rest a digit on 0");
@@ -760,8 +1121,8 @@ test("the TOKENS stat renders the app's rolling odometer as SMIL", () => {
   // figure (11.55B) has no zero digit; a percent row's "0" (60%) legitimately
   // rests at zero and must not travel.
   const tokStrips = new RegExp(
-    '<g clip-path="url\\(#odo-tok-\\d+\\)"><g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
-      "(?:<text[^>]*>\\d</text>){10}" +
+    '<g clip-path="url\\(#odo-tok-\\d+\\)"[^>]*><g(?: transform="translate\\(0 [\\d.]+\\)")?>' +
+      "(?:<text[^>]*>\\d</text>)+" +
       '<animateTransform[^>]*values="([^"]*)"',
     "g",
   );
